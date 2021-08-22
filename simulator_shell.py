@@ -47,5 +47,8 @@ class Shell( ShellCommon ):
     def do_simulate( self, args ):
         self.config.app.simulate( args )
 
+    def do_intraday_off( self, args ):
+        self.config.app.intradayOff( args )
+        
     def do_show_pnl( self, args ):
         self.config.app.calc_pnl( args )

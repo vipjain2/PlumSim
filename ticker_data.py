@@ -6,32 +6,14 @@ from pyEX.client import _INCLUDE_POINTS_RATES
 
 
 class Data_loader( object ):
-    def __init__( self, data_dir,  ):
-        self._downloaded = False
+    def __init__( self, data_dir ):
         self.ticker = None
         self.path_prefix = None
         self.data_dir = pathlib.Path( data_dir )
-
+        self.intraday_off = False
+        
         if not self.data_dir.exists():
             return None
-
-    def data( self, ticker, start_date=None, end_date=None, period="daily" ):
-        if ticker is None:
-            return None
-        self.ticker = ticker.strip().upper()
-
-        self.path_prefix = self.data_dir.joinpath( self.ticker )
-
-        if not self.path_prefix.exists():
-            self.path_prefix.mkdir( parents=True, exist_ok=True )
-
-        daily_data = self.loader( "daily" )
-        intraday_data = self.loader( "intraday" )
-
-        if period == "daily":
-            return daily_data
-        else:
-            return intraday_data
 
     def loader( self, period ):
         """
@@ -39,6 +21,9 @@ class Data_loader( object ):
         If no .csv file exists, downloads entire historical data till today
         Does not deal with a corrupted .csv file yet.
         """
+        if period == "intraday" and self.intraday_off:
+            return None
+
         file_name_suffix = "-daily.csv" if period == "daily" else "-intraday-1m.csv"
         file_path = self.path_prefix.joinpath( self.ticker + file_name_suffix )
         
@@ -86,21 +71,58 @@ class Data_loader( object ):
 
         return data
 
+    def data( self, ticker, period="daily" ):
+        if ticker is None:
+            return None
+        self.ticker = ticker.strip().upper()
+
+        self.path_prefix = self.data_dir.joinpath( self.ticker )
+
+        if not self.path_prefix.exists():
+            self.path_prefix.mkdir( parents=True, exist_ok=True )
+
+        daily_data = self.loader( "daily" )
+        intraday_data = self.loader( "intraday" )
+
+        if period == "daily" and not daily_data.empty:
+            return self.formatDailyData( daily_data )
+        elif not intraday_data.empty:
+            return self.formatIntradayData( intraday_data )
+
     def download( self, start_date=None, period="daily" ):
         if period == "daily":
             return self.daily( start_date=start_date )
         elif period == "intraday":
             return self.intraday( start_date=start_date )    
 
+
+    ######################################################################
+    # All the data provider specific functions start from here
+    ######################################################################
+    def formatDailyData( self, df ):
+        df = df[ [ 'date', 'close',	'high', 'low',	'open', 'symbol', 'volume' ] ].set_index( 'date' )
+        return df
+
+    def formatIntradayData( self, df ):
+            df = df[ [ 'date', 'minute', 'marketHigh', 'marketLow', 'marketOpen', 'marketClose', 'marketVolume' ] ]
+            return df.rename( columns={ 'marketHigh': 'high',
+                                        'marketLow': 'low',
+                                        'marketOpen': 'open',
+                                        'marketClose': 'close',
+                                        'marketVolume': 'volume' }, inplace=True )
+
     def daily( self, start_date=None ):
-        timeframe = self.get_timeframe( start_date )
+        timeframe = self.getTimeframe( start_date )
 
         import pyEX as p
         c = p.Client( api_token="pk_20bcce55e4f041c4b8bdc8bf1c856a08", version="stable" )
         print( "downloading latest daily data." )
-        df = c.chartDF( symbol=self.ticker, timeframe=timeframe, sort="asc" )
-        
-        self._downloaded = True
+
+        try:
+            df = c.chartDF( symbol=self.ticker, timeframe=timeframe, sort="asc" )
+        except:
+            print( "Failed to download." )
+            return pd.DataFrame()
 
         if start_date:
             end_date = pd.to_datetime( "today" )
@@ -121,13 +143,18 @@ class Data_loader( object ):
         df=pd.DataFrame()
         for d in pd.date_range( start=start_date, end=datetime.date.today() ):
             print( "downloading intraday data for %s:" % d )
-            downloaded_data = c.intradayDF( symbol=self.ticker, date=d )
+            try:
+                downloaded_data = c.intradayDF( symbol=self.ticker, date=d )
+            except:
+                print( "Failed to download." )
+                return pd.DataFrame()
+
             df = pd.concat( [ df, downloaded_data ] )
 
         df.reset_index( inplace=True )
         return df
 
-    def get_timeframe( self, start_date ):
+    def getTimeframe( self, start_date ):
         if start_date is None:
             timeframe="max"
         else:
@@ -150,11 +177,6 @@ class Data_loader( object ):
                 timeframe = "max"
 
         return timeframe
-
-    def downloaded( self ):
-        x = self._downloaded
-        self._downloaded = False
-        return x
 
 
 class Data_loader_utils( Data_loader ):
