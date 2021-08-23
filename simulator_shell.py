@@ -2,9 +2,8 @@ from shell_common import ShellCommon, ShellConfig
 
 
 class Shell( ShellCommon ):
-    def __init__(self, config):
+    def __init__(self, config ):
         super().__init__( config )
-        
 
     ####################################
     # All do_* command functions go here
