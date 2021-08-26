@@ -1,3 +1,4 @@
+from os import name
 from pathlib import Path
 from collections import OrderedDict
 import pandas as pd
@@ -19,9 +20,10 @@ import dash_bootstrap_components as dbc
 import dash_core_components as dcc
 import dash_html_components as html
 from dash.dependencies import Input, Output
-from ticker_data import Data_loader
+from ticker_data import DataLoader, DataLoaderUtils
 
 from simulator_shell import Shell, ShellConfig
+from utils_common import timer, timerData
 
 DATA_DIR = "./data"
 CONFIG_FILE = "./.plumsim.config.json"
@@ -35,8 +37,8 @@ STRATEGY_FILE = "./Strategy1.simulate"
 class PlumsimConfig( object ):
     threads = []
     web_thread_active = True
-
-plumsimConfig = PlumsimConfig()
+    intraday = True
+    verbose = True
 
 ########################################################################
 # 
@@ -48,33 +50,24 @@ class TradeType( Enum ):
     COVER = 4
 
 class TradeEngine( object ):
-    def __init__( self, ticker, buy_strategy, sell_strategy, params={}, period="daily" ):
+    def __init__( self, ticker, buyStrategy, sellStrategy, params={} ):
         self._ticker = ticker
-        self.buy_strategy = buy_strategy
-        self.sell_strategy = sell_strategy
+        self.buyStrategy = buyStrategy
+        self.sellStrategy = sellStrategy
         self.params = params
-        self.period = period
         self.stdin = sys.stdin
         self.stdout = sys.stdout
 
-        self.loader = Data_loader( DATA_DIR )
+        self.loader = DataLoader( DATA_DIR )
 
-        if self.period == "daily":
-            self.loader.intraday_off = True
+        self.data = self.loader.data( ticker, period="daily" )
+        self.intradayData = self.loader.data( ticker, period="intraday" )
 
-        self.data = self.loader.data( ticker )
         self.setup()
-        self.trades = pd.DataFrame( columns=[ 'Date', 'Ticker', 'Type', 'Price', 'Quantity' ] )
-        self.positions = pd.DataFrame( columns=[ 'Date', 'Ticker', 'Type', 'Price', 'Quantity' ] )
+        self.trades = pd.DataFrame( columns=[ 'Date', 'Ticker', 'Type', 'Strategy', 'Price', 'Quantity' ] )
+        self.positions = pd.DataFrame( columns=[ 'Date', 'Ticker', 'Type', 'Strategy', 'Price', 'Quantity' ] )
 
-        self.getBuys( buy_strategy )
-        self.getSales( sell_strategy )
-        self.cleanup()
-        
     def setup( self ):
-        if self.period == "daily":
-            self.loader.intraday_off = True
-
         self.data.rename( columns={ 'close': 'Close',
                                     'open': 'Open',
                                     'low': 'Low', 
@@ -87,8 +80,8 @@ class TradeEngine( object ):
         self.data[ "GapOpen" ] = self.data.apply( lambda row : ( row[ "Open" ] - row[ "PrevClose" ] ) / row[ "PrevClose" ], axis=1 )
 
         # Add indicators
-        self.calc_ma( [ 10, 20, 50, 65, 100, 200 ] )
-        self.calc_trend( [ 10, 20, 50, 100, 200 ] )
+        self.calc_ma( [ 10, 15, 20, 50, 65, 100, 200 ] )
+        #self.calc_trend( [ 10, 20, 50, 100, 200 ] )
         self.data[ "Range" ] = self.data[ "High" ] / self.data[ "Low" ]
         self.data[ "ADR" ] = round( ( self.data[ "Range" ].rolling( 20 ).mean() - 1 ) * 100, 2 )
 
@@ -108,33 +101,27 @@ class TradeEngine( object ):
 
 
     def processTimeframe( self, timeframe, date ):
-        p = r"""
-        (\d?\d?[a-zA-Z]+)(\d?\d?)?          # Match things like Day1, 5min1
-        [ ]?-?[ ]?                          # " - ", optional
-        (\d?\d?[a-zA-Z]+)?(\d?\d?)?         # second instance of Day2, 5min2 etc.
-        """
-        m = re.match( p, timeframe, re.VERBOSE )
-
-        ( d1, t1, d2, t2 ) = m.groups()
+        ( d1, t1, d2, t2 ) = timeframe
         # The following stetement block should be converted to structural pattern matching
         # once we upgrade to Python 3.10
         if ( d1, t1, d2 ) == ( "Day", "1", None ):
-            startTime = date
-            endTime = date
+            data = self.data.loc[ date : date ]
         elif ( d1, d2 ) == ( "Day", "Day" ):
             pass
         elif ( d1, d2 ) == ( "Day", "All" ):
-            startTime = date
-            endTime = None
+            data = self.data.loc[ date : ]
+        elif ( d1, d2 ) == ( "1Min", "1Min" ):
+            data = self.intradayData.loc[ date ]
         else:
             print( "Syntax error in timeframe" )
-            return None
-        return ( startTime, endTime )
-
+            data = None
+        return data
+    
+    @timer
     def executeCondition( self, condition, globalVars, localVars ):
         globals = globalVars
         locals = localVars
-        condition = f"returnVal=({condition})"
+        condition = f"returnVal={condition}"
         try:
             code = compile( condition + "\n", "<stdin>", "single" )
             saved_stdin = sys.stdin
@@ -152,113 +139,126 @@ class TradeEngine( object ):
             print( traceback.format_exception_only( *exec_info )[ -1 ].strip() )
         return locals[ "returnVal" ]
 
-    def findTrade( self, type, data, condition, qty, priceCondition, env ):
+    @timer
+    def findTrade( self, type, data, condition, qty, priceCondition, newStopLoss, env ):
         """Takes a table of daily or intraday price data and finds the first row entry that meets the trading condition
 
         Inputs - 
             Type : Trade type as in sell, buy, short, cover
             Data : intraday or daily data
         """
-        data = data.to_dict( "index" )
+        #data = data.to_dict( "index" )
         price = 0
-        for date, row in data.items():
-            globals = {}
-            locals = env
-            locals.update( row )               
-            
-            if type == TradeType.SELL:                
-                drawdown = ( locals[ 'Price' ] - row[ 'Low' ] ) / locals[ 'Price' ]
+        globals = env
+        date = None
+        for d in data.itertuples():
+            date = d.Index
+            locals = d._asdict()
+
+            # Some special processing for sell or cover trades. 
+            # Drawdown and stop loss need to be calculcated only once we are in a trade.
+            if type == TradeType.SELL or type == TradeType.COVER:                
+                drawdown = self.executeCondition( "( Price - Low ) / Price", globals, locals )
                 locals.update ( { 'Drawdown' : drawdown } )                
 
+                # Test the stoploss if one exists
+                if globals[ 'StopLoss' ] > 0:
+                    ret = self.executeCondition( "Low < StopLoss", globals, locals )
+                    if ret:
+                        price = self.executeCondition( "StopLoss * ( 1 - DISPERSION )", globals, locals )
+                        qty = 1             # better Qty is to use the remaining buy qty
+                        break
+
             ret = self.executeCondition( condition, globals, locals )
-            
             if ret:
                 price = self.executeCondition( priceCondition, globals, locals )
+                if newStopLoss:
+                    stoploss = self.executeCondition( f"{newStopLoss}", globals, locals )
+                    env[ 'StopLoss' ] = stoploss
                 qty = qty
                 break
-        return ( price, qty )
+        return ( price, qty, date )
 
+    @timer
     def getBuys( self, strategy ):
         if self.data.empty:
             return
         
-        type = TradeType.BUY
+        print( "{}: calculating buy trades.".format( self.ticker() ) )
 
-        print( "Calculating buy trades." )
+        type = TradeType.BUY
         tradeId = 1
         env = self.params
         for p in self.data.itertuples( index=True ):
             date = p.Index
             
-            for strategyName in strategy:
-                ( timeframe, qty, condition, priceCondition ) = strategy[ strategyName ]
+            for name in strategy:
+                ( timeframe, qty, condition, priceCondition, stopLoss ) = strategy[ name ]
 
-                startDate, endDate = self.processTimeframe( timeframe, date )
-
-                if endDate == None:
-                    data = self.data.loc[ startDate : ]
-                else:
-                    data = self.data.loc[ startDate : endDate ]
+                data = self.processTimeframe( timeframe, date )
 
                 # Now we walk through data from startTime till endTime and find out if we meet the trade condition
-                ( price, qty ) = self.findTrade( TradeType.BUY, data, condition, qty, priceCondition, env )
+                ( price, qty, _ ) = self.findTrade( TradeType.BUY, data, condition, qty, priceCondition, stopLoss, env )
 
                 if price > 0:
-                    self.positions.loc[ tradeId ] = { 'Date': date, 'Type': type, 'Strategy' : strategyName, 'Price': price, 'Quantity': qty, 'Ticker': self.ticker() }
+                    self.positions.loc[ tradeId ] = { 'Date': date, 'Type': type, 'Strategy' : name, 'Price': price, 'Quantity': qty, 'Ticker': self.ticker() }
                     tradeId += 1
 
         self.positions[ 'Date' ] = pd.to_datetime( self.positions[ 'Date' ] )
 
+    @timer
     def getSales( self, strategy ):
         if self.positions.empty:
             return
 
+        print( "{}: calculating sell trades.".format( self.ticker() ) )
+
         type = TradeType.SELL
-
-        print( "Calculating sell trades." )
-
         tradeId = 1
+        env = self.params
         for p in self.positions.itertuples( index=False ):
             date = p.Date
             totalQty = p.Quantity
-            self.trades.loc[ tradeId ] = { 'Date': date, 'Type': p.Type, 'Price': p.Price, 'Quantity': p.Quantity, 'Ticker': self.ticker() }
+            env.update( { 'Price' : p.Price, 'StopLoss' : 0 } )
+            
+            self.trades.loc[ tradeId ] = p
             tradeId += 1
-
-            localVars = self.params
-            localVars.update( { 'Price' : p.Price } )
             
             # Now we apply the sell conditions one by one until the entire position has been sold
             # For each confition, we first fetch the date range that this condition needs to be applied to
-            for strategyName in strategy:
+            for name in strategy:
+                ( timeframe, qty, condition, priceCondition, stopLoss ) = strategy[ name ]
+
                 if totalQty == 0:
                     continue
 
-                ( timeframe, qty, condition, priceCondition ) = strategy[ strategyName ]
+                data = self.processTimeframe( timeframe, date )
+                
+                # If the last trade was a partial sell, we need the next day to start executing 
+                # a sell strategy on the remaining quantity.
+                if totalQty < 1:
+                    data = data[ 1 : ]
+                
+                # Now we walk through data from startTime till endTime 
+                # and find out if we meet the sell condition
+                ( price, qty, date ) = self.findTrade( TradeType.SELL, data, condition, qty, priceCondition, stopLoss, env )
 
-                startDate, endDate = self.processTimeframe( timeframe, date )
-
-                if endDate == None:
-                    data = self.data.loc[ startDate : ]
-                else:
-                    data = self.data.loc[ startDate : endDate ]
-
-                # Now we walk through data from startTime till endTime and find out if we meet the sell condition
-                ( price, qty ) = self.findTrade( TradeType.SELL, data, condition, qty, priceCondition, localVars )
-                if price > 0:
-                    self.trades.loc[ tradeId ] = { 'Date': p.Date, 'Type': type, 'Strategy' : strategyName, 'Price': price, 'Quantity': qty, 'Ticker': self.ticker() }
+                if price > 0 and qty > 0:
+                    qty = totalQty if totalQty < qty else qty
+                    self.trades.loc[ tradeId ] = { 'Date': date, 'Type': type, 'Strategy' : name, 'Price': price, 'Quantity': qty, 'Ticker': self.ticker() }
                     totalQty -= qty
                     tradeId += 1
 
         self.trades[ 'Date' ] = pd.to_datetime( self.trades[ 'Date' ] )
 
+
     def consolidateTrades( self, trades ):
         consolidatedTrades = pd.DataFrame( columns=[ 'Date', 'Ticker', 'Type', 'BuyPrice', 'SellPrice', 'Profit' ] )
-        consolidatedTrades[ 'Ticker' ] = self.ticker()
 
         curTradeId = 0
         avgSellPrice = 0
         curQty = 0
-        
+
         for t in trades.itertuples( index=True ):
             if t.Type == TradeType.BUY:
                 consolidatedTrades.loc[ t.Index ] = { 'Date': t.Date, 'BuyPrice': t.Price, 'Type' : 'LONG' }
@@ -271,10 +271,11 @@ class TradeEngine( object ):
                     curQty = 0
                     curTradeId = t.Index
             elif t.Type == TradeType.SELL:
+                avgSellPrice = ( avgSellPrice * curQty + t.Price * t.Quantity ) / ( curQty + t.Quantity )
                 curQty += t.Quantity
-                avgSellPrice = ( avgSellPrice + t.Price * t.Quantity ) / curQty
                 consolidatedTrades.at[ curTradeId, 'SellPrice' ] = avgSellPrice
-        
+
+        consolidatedTrades[ 'Ticker' ] = self.ticker()        
         consolidatedTrades[ 'Profit'] = ( consolidatedTrades[ 'SellPrice' ] - consolidatedTrades[ 'BuyPrice' ] ) / consolidatedTrades[ 'BuyPrice' ]
         return consolidatedTrades
 
@@ -286,6 +287,7 @@ class TradeEngine( object ):
             endDate = self.trades.index[ -1 ]
         trades = self.trades.query( 'Date > @startDate and Date < @endDate', inplace=False )
 
+        #print( trades )
         if consolidate:
             return self.consolidateTrades( trades )
         else:
@@ -293,6 +295,14 @@ class TradeEngine( object ):
 
     def trade( self, date, consolidate=True ):
         return self.tradeRange( date, date )
+
+
+    def run( self, buy=True, sell=True ):
+        if buy:
+            self.getBuys( self.buyStrategy )
+        if sell:
+            self.getSales( self.sellStrategy )
+        self.cleanup()
 
     def cleanup( self ):
         pass
@@ -302,15 +312,16 @@ class Stats( object ):
     numLoss = 0
 
 class Simulator( object ):
-    def __init__( self, env={} ) -> None:
+    def __init__( self, config, env={} ) -> None:
         self.env = env
         self.trades_master = pd.DataFrame()
         self.buyStrategy = OrderedDict()
         self.sellStrategy = OrderedDict()
         self.tickers = []
         self.stats = Stats()
-        self.period = "daily"
         self.params = {}
+        self.config = config
+        self.cache = {}
 
     def setTickers( self, args ):
         def processArgs( args ):
@@ -369,9 +380,17 @@ class Simulator( object ):
         start_date = pd.to_datetime( self.params[ "START_DATE" ] )
         end_date = pd.to_datetime( self.params[ "END_DATE" ] )
 
+        threads = []
         for t in self.tickers:
-            trader = TradeEngine( t, self.buyStrategy, self.sellStrategy, self.params, self.period )
+            trader = TradeEngine( t, self.buyStrategy, self.sellStrategy, self.params )
+            self.cache[ t ] = trader
+            buy, sell = ( True, True )
+            trader.run( buy, sell )
+        
+        for t in self.tickers:
+            trader = self.cache[ t ] 
             trades = trader.tradeRange( start_date, end_date )
+
             if trades is not None and not trades.empty:
                 self.trades_master = pd.concat( [ self.trades_master, trades ] )
 
@@ -381,13 +400,12 @@ class Simulator( object ):
 
         self.trades_master.sort_values( by=[ "Date" ], inplace=True )
 
-        self.calc_pnl()
+        self.calcPnl()
         self.stats.numWin = self.trades_master[ self.trades_master[ "Profits" ] > 0 ][ "Profits" ].count()
         self.stats.numLoss = self.trades_master[ self.trades_master[ "Profits" ] < 0 ][ "Profits" ].count()
-
         self.print_summary( simulator.trades_master )
 
-    def calc_pnl( self, args=None ):
+    def calcPnl( self, args=None ):
         self.trades_master[ 'Invested' ] = self.params[ "INIT_CAP" ]
 
         if self.params[ "COMPOUND" ]:
@@ -399,36 +417,20 @@ class Simulator( object ):
         self.trades_master[ "Profits" ] =  self.trades_master[ "Invested" ] * self.trades_master[ "Profit" ]
         self.trades_master[ "AggregateProfits" ] = self.trades_master[ "Profits" ].cumsum()
 
-    def intradayOff( self, args ):
-        self.period = "daily"
+    def showTrades( self, args ):
+        start_date = pd.to_datetime( self.params[ "START_DATE" ] )
+        end_date = pd.to_datetime( self.params[ "END_DATE" ] )
+
+        ticker = args.strip().upper()
+
+        if not ticker or ticker not in self.cache:
+            return
+
+        trades = self.cache[ ticker ].tradeRange( start_date, end_date, consolidate=False )
+        print( trades )
 
     def exit( self ):
         print( "Exiting simulator" )
-
-    def data_update_cache( self, args ):
-        data_dir = "./data"
-        loader = Data_loader( data_dir )
-        for p in Path( data_dir ).iterdir():
-            if p.is_dir():
-                print( p.name )
-                ticker = str( p.name )
-                loader.data( ticker )
-
-    def download_data( self, args ):
-        wl_path = Path( args.strip() )
-        if not wl_path.is_file():
-            print( "Did not find file." )
-            return
-
-        wl = pd.read_csv( wl_path )
-        loader = Data_loader( DATA_DIR )
-        for t in wl[ "Symbols" ]:
-            print( t )
-            ticker = t.strip()
-            try:
-                loader.data( ticker )
-            except:
-                pass
 
     def saveConfig( self, args ):
         _config = {}
@@ -442,13 +444,28 @@ class Simulator( object ):
         for k, v in self.params.items():
             print( f"{k} : {v}" )
 
+    def initParams( self ):
+        self.params = { 'Amount' : 0 }
+
     def loadStrategy( self, args ):
         timeframe = "Day-All"
         output = None
+        stoploss = None
+
+        def _parseTimeframe( timeframe ):
+            p = r"""
+            (\d?\d?[a-zA-Z]+)(\d?\d?:?\d?\d?)?          # Match things like Day1, 5min1
+            [ ]?-?[ ]?                                  # " - ", optional
+            (\d?\d?[a-zA-Z]+)?(\d?\d?:?\d?\d?)?         # second instance of Day2, 5min2 etc.
+            """
+
+            m = re.match( p, timeframe, re.VERBOSE )
+            return m.groups()
 
         def _parseCondition( key, value ):
             nonlocal timeframe
             nonlocal output
+            nonlocal stoploss
             if isinstance( value, dict ):
                 input = []
 
@@ -474,6 +491,9 @@ class Simulator( object ):
             elif "Timeframe" in key:
                 timeframe = value
                 return "()"
+            elif "StopLoss" in key:
+                stoploss = value
+                return "()"
                 
         def _parseAction( key ):
             try:
@@ -493,22 +513,28 @@ class Simulator( object ):
             except:
                 print( "Numeric value needed" )
                 return None
-
             return ( action, qty )
 
-        strategyName = args.strip()
+        name = args.strip()
 
         with open( STRATEGY_FILE, 'r') as f:
-            dictionary = yaml.load( f, Loader=yaml.FullLoader )
+            strategyDict = yaml.load( f, Loader=yaml.FullLoader )
 
-        if strategyName in dictionary:
-            strategy = dictionary[ strategyName ]
+        if name in strategyDict:
+            strategy = strategyDict[ name ]
         else:
             print( "Strategy not found." )
             return
 
-        print( "strategy : {}".format( strategyName ) )
+        print( "strategy : {}".format( name ) )
         print( "=====================================" )
+        cacheKey = f"_{name}"
+        if cacheKey in self.cache:
+            oldStrategy = self.cache[ cacheKey ]
+
+        self.cache[ cacheKey ] = strategy
+        
+        self.initParams()
         for key, value in strategy.items():
             if key.upper() == "PARAMS":
                 for k, v in value.items():
@@ -523,15 +549,17 @@ class Simulator( object ):
                 timeframe = "Day-All"
                 output = None
                 condition = _parseCondition( key, value )
-                self.buyStrategy[ action ] = ( timeframe, qty, condition, output )
-                print( "{} : {}".format( key, self.buyStrategy[ key ] ) )
+                timeframe = _parseTimeframe( timeframe )
+                self.buyStrategy[ action ] = ( timeframe, qty, condition, output, stoploss )
+                print( "{} : {}".format( key, self.buyStrategy[ action ] ) )
 
             if "SELL" in key.upper():
                 timeframe = "Day-All"
                 output = None
                 condition = _parseCondition( key, value )
-                self.sellStrategy[ action ] = ( timeframe, qty, condition, output )           
-                print( "{} : {}".format( key, self.sellStrategy[ key ] ) )
+                timeframe = _parseTimeframe( timeframe )
+                self.sellStrategy[ action ] = ( timeframe, qty, condition, output, stoploss )           
+                print( "{} : {}".format( key, self.sellStrategy[ action ] ) )
             print( "---" )
 
     def printStrategy( self, args ):
@@ -540,12 +568,14 @@ class Simulator( object ):
             for key, value in dictionary.items():
                 print ( "{} : {}\n".format( key, str( value ) ) )
 
-
+    def printTimerInfo( self ):
+        print( timerData )
 
 if __name__ == "__main__":
     pd.set_option( "display.max_rows", None )
 
-    simulator = Simulator()
+    plumsimConfig = PlumsimConfig()
+    simulator = Simulator( config=plumsimConfig )
 
     app = dash.Dash( external_stylesheets=[dbc.themes.BOOTSTRAP] )
     app.layout = dbc.Container(
@@ -594,6 +624,8 @@ if __name__ == "__main__":
     config.app = simulator
     config.config = plumsimConfig
     config.config.threads = [ web_thread ]
+    config.utils = DataLoaderUtils()
+
     shell = Shell( config )
     shell.prompt = '%s>> ' % ( "SIMULATOR" )
     shell._cmdloop( "" )

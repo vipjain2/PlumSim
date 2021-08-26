@@ -21,10 +21,10 @@ class Shell( ShellCommon ):
         raise SystemExit
 
     def do_update_cache( self, args ):
-        self.config.app.data_update_cache( args )
+        self.config.utils.data_update_cache( args )
 
     def do_download_data( self, args ):
-        self.config.app.download_data( args )
+        self.config.utils.download_data( args )
     
     def do_load_strategy( self, args ):
         self.config.app.read_strategy_file( args )
@@ -43,11 +43,11 @@ class Shell( ShellCommon ):
     def do_clear_trades( self, args ):
         self.config.app.clearTrades( args )
 
+    def do_show_trades( self, args ):
+        self.config.app.showTrades( args )
+        
     def do_simulate( self, args ):
         self.config.app.simulate( args )
-
-    def do_intraday_off( self, args ):
-        self.config.app.intradayOff( args )
         
     def do_show_pnl( self, args ):
         self.config.app.calc_pnl( args )

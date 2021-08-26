@@ -1,18 +1,41 @@
 import pandas as pd
 import pathlib
+from pathlib import Path
 import datetime
 
 from pyEX.client import _INCLUDE_POINTS_RATES
 
 
-class Data_loader( object ):
+class DataLoader( object ):
     def __init__( self, data_dir ):
         self.ticker = None
         self.path_prefix = None
         self.data_dir = pathlib.Path( data_dir )
-        self.intraday_off = False
+        self.minimizeDownload = True
         
         if not self.data_dir.exists():
+            return None
+
+    def data( self, ticker, period="daily" ):
+        if ticker is None:
+            return None
+
+        self.ticker = ticker.strip().upper()
+
+        self.path_prefix = self.data_dir.joinpath( self.ticker )
+
+        if not self.path_prefix.exists():
+            self.path_prefix.mkdir( parents=True, exist_ok=True )
+
+        if period == "daily":
+            daily_data = self.loader( "daily" )
+            if not daily_data.empty:
+                return self.formatDailyData( daily_data )
+        elif period == "intraday":
+            intradayData = self.loader( "intraday" )
+            if not intradayData.empty:
+                return self.formatIntradayData( intradayData )
+        else:
             return None
 
     def loader( self, period ):
@@ -21,8 +44,6 @@ class Data_loader( object ):
         If no .csv file exists, downloads entire historical data till today
         Does not deal with a corrupted .csv file yet.
         """
-        if period == "intraday" and self.intraday_off:
-            return None
 
         file_name_suffix = "-daily.csv" if period == "daily" else "-intraday-1m.csv"
         file_path = self.path_prefix.joinpath( self.ticker + file_name_suffix )
@@ -71,30 +92,14 @@ class Data_loader( object ):
 
         return data
 
-    def data( self, ticker, period="daily" ):
-        if ticker is None:
-            return None
-        self.ticker = ticker.strip().upper()
-
-        self.path_prefix = self.data_dir.joinpath( self.ticker )
-
-        if not self.path_prefix.exists():
-            self.path_prefix.mkdir( parents=True, exist_ok=True )
-
-        daily_data = self.loader( "daily" )
-        intraday_data = self.loader( "intraday" )
-
-        if period == "daily" and not daily_data.empty:
-            return self.formatDailyData( daily_data )
-        elif not intraday_data.empty:
-            return self.formatIntradayData( intraday_data )
-
     def download( self, start_date=None, period="daily" ):
         if period == "daily":
             return self.daily( start_date=start_date )
         elif period == "intraday":
-            return self.intraday( start_date=start_date )    
-
+            if self.minimizeDownload and start_date is not None and ( datetime.datetime.now() - start_date ).days < 3:
+                return pd.DataFrame()
+            else:
+                return self.intraday( start_date=start_date )    
 
     ######################################################################
     # All the data provider specific functions start from here
@@ -104,12 +109,14 @@ class Data_loader( object ):
         return df
 
     def formatIntradayData( self, df ):
-            df = df[ [ 'date', 'minute', 'marketHigh', 'marketLow', 'marketOpen', 'marketClose', 'marketVolume' ] ]
-            return df.rename( columns={ 'marketHigh': 'high',
-                                        'marketLow': 'low',
-                                        'marketOpen': 'open',
-                                        'marketClose': 'close',
-                                        'marketVolume': 'volume' }, inplace=True )
+        df.rename( columns={ 'marketHigh': 'high',
+                             'marketLow': 'low',
+                             'marketOpen': 'open',
+                             'marketClose': 'close',
+                             'marketVolume': 'volume' }, inplace=True )
+        
+        df = df[ [ 'date', 'minute', 'high', 'low', 'open', 'close', 'volume' ] ].set_index( [ 'date', 'minute' ] )
+        return df
 
     def daily( self, start_date=None ):
         timeframe = self.getTimeframe( start_date )
@@ -179,6 +186,38 @@ class Data_loader( object ):
         return timeframe
 
 
-class Data_loader_utils( Data_loader ):
-    def __init__( self ):
-        super.__init__()
+class DataLoaderUtils( object ):
+    def __init__( self ) -> None:
+        super().__init__()
+        self.data_dir = "./data"
+
+    def data_update_cache( self, args ):
+        loader = DataLoader( self.data_dir )
+        saved_minimizeDownload = loader.minimizeDownload
+        loader.minimizeDownload = False
+        for p in Path( self.data_dir ).iterdir():
+            if p.is_dir():
+                print( p.name )
+                ticker = str( p.name )
+                loader.data( ticker, period="daily" )
+                loader.data( ticker, period="intraday" )
+        loader.minimizeDownload = saved_minimizeDownload
+
+    def download_data( self, args ):
+        """Takes a filename as argument and downloads historical data for all symbols in the file
+        """
+        wl_path = Path( args.strip() )
+        if not wl_path.is_file():
+            print( "Did not find file." )
+            return
+
+        wl = pd.read_csv( wl_path )
+        loader = DataLoader( self.data_dir )
+        for t in wl[ "Symbols" ]:
+            print( t )
+            ticker = t.strip()
+            try:
+                loader.data( ticker, period="daily" )
+                loader.data( ticker, period="intraday" )
+            except:
+                pass
