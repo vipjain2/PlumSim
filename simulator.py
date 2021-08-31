@@ -1,4 +1,3 @@
-from os import name
 from pathlib import Path
 from collections import OrderedDict
 import pandas as pd
@@ -8,7 +7,6 @@ import time
 import json
 import yaml
 import re
-import sys, code, traceback
 from enum import Enum
 
 from dash_html_components.Hr import Hr
@@ -20,12 +18,12 @@ import dash_bootstrap_components as dbc
 import dash_core_components as dcc
 import dash_html_components as html
 from dash.dependencies import Input, Output
-from ticker_data import DataLoader, DataLoaderUtils
+from ticker_data import DataLoaderUtils
 
 from simulator_shell import Shell, ShellConfig
 from utils_common import timer, timerData
+from trade_engine import TradeEngine
 
-DATA_DIR = "./data"
 CONFIG_FILE = "./.plumsim.config.json"
 STRATEGY_FILE = "./Strategy1.simulate"
 
@@ -33,7 +31,6 @@ STRATEGY_FILE = "./Strategy1.simulate"
 # Various classes to hold global settings etc. which can be accessed and 
 # manupulated inside disconnected classes
 ########################################################################
-
 class PlumsimConfig( object ):
     threads = []
     web_thread_active = True
@@ -41,272 +38,8 @@ class PlumsimConfig( object ):
     verbose = True
 
 ########################################################################
-# 
+# Simulator code starts here
 ########################################################################
-class TradeType( Enum ):
-    BUY = 1,
-    SELL = 2,
-    SHORT = 3,
-    COVER = 4
-
-class TradeEngine( object ):
-    def __init__( self, ticker, buyStrategy, sellStrategy, params={} ):
-        self._ticker = ticker
-        self.buyStrategy = buyStrategy
-        self.sellStrategy = sellStrategy
-        self.params = params
-        self.stdin = sys.stdin
-        self.stdout = sys.stdout
-
-        self.loader = DataLoader( DATA_DIR )
-
-        self.data = self.loader.data( ticker, period="daily" )
-        self.intradayData = self.loader.data( ticker, period="intraday" )
-
-        self.setup()
-        self.trades = pd.DataFrame( columns=[ 'Date', 'Ticker', 'Type', 'Strategy', 'Price', 'Quantity' ] )
-        self.positions = pd.DataFrame( columns=[ 'Date', 'Ticker', 'Type', 'Strategy', 'Price', 'Quantity' ] )
-
-    def setup( self ):
-        self.data.rename( columns={ 'close': 'Close',
-                                    'open': 'Open',
-                                    'low': 'Low', 
-                                    'high': 'High' }, inplace=True )
-        self.data.index.rename( 'Date', inplace=True )
-        self.data.sort_index( inplace=True )
-
-        self.data[ "PrevClose" ] = self.data.shift( axis=0 )[ "Close" ]
-        self.data[ "PrevDayHigh" ] = self.data.shift( axis=0 )[ "High" ]
-        self.data[ "GapOpen" ] = self.data.apply( lambda row : ( row[ "Open" ] - row[ "PrevClose" ] ) / row[ "PrevClose" ], axis=1 )
-
-        # Add indicators
-        self.calc_ma( [ 10, 15, 20, 50, 65, 100, 200 ] )
-        #self.calc_trend( [ 10, 20, 50, 100, 200 ] )
-        self.data[ "Range" ] = self.data[ "High" ] / self.data[ "Low" ]
-        self.data[ "ADR" ] = round( ( self.data[ "Range" ].rolling( 20 ).mean() - 1 ) * 100, 2 )
-
-    def ticker( self ):
-        return self._ticker
-
-    def calc_ma( self, mas ):
-        for i in mas:
-            ma_name = "MA%d" % i
-            self.data[ ma_name ] = self.data[ "Close" ].ewm( span=i ).mean()
-
-    def calc_trend( self, args ):
-        for t in args:
-            name = "Trend%d" % t
-            ma = "MA%d" % t
-            self.data[ name ] = self.data[ ma ].ewm( span=5 ).mean()
-
-
-    def processTimeframe( self, timeframe, date ):
-        ( d1, t1, d2, t2 ) = timeframe
-        # The following stetement block should be converted to structural pattern matching
-        # once we upgrade to Python 3.10
-        if ( d1, t1, d2 ) == ( "Day", "1", None ):
-            data = self.data.loc[ date : date ]
-        elif ( d1, d2 ) == ( "Day", "Day" ):
-            pass
-        elif ( d1, d2 ) == ( "Day", "All" ):
-            data = self.data.loc[ date : ]
-        elif ( d1, d2 ) == ( "1Min", "1Min" ):
-            data = self.intradayData.loc[ date ]
-        else:
-            print( "Syntax error in timeframe" )
-            data = None
-        return data
-    
-    @timer
-    def executeCondition( self, condition, globalVars, localVars ):
-        globals = globalVars
-        locals = localVars
-        condition = f"returnVal={condition}"
-        try:
-            code = compile( condition + "\n", "<stdin>", "single" )
-            saved_stdin = sys.stdin
-            saved_stdout = sys.stdout
-            sys.stdin = self.stdin
-            sys.stdout = self.stdout
-
-            try:
-                exec( code, globals, locals )
-            finally:
-                sys.stdin = saved_stdin
-                sys.stdout = saved_stdout
-        except:
-            exec_info = sys.exc_info()[ :2 ]
-            print( traceback.format_exception_only( *exec_info )[ -1 ].strip() )
-        return locals[ "returnVal" ]
-
-    @timer
-    def findTrade( self, type, data, condition, qty, priceCondition, newStopLoss, env ):
-        """Takes a table of daily or intraday price data and finds the first row entry that meets the trading condition
-
-        Inputs - 
-            Type : Trade type as in sell, buy, short, cover
-            Data : intraday or daily data
-        """
-        #data = data.to_dict( "index" )
-        price = 0
-        globals = env
-        date = None
-        for d in data.itertuples():
-            date = d.Index
-            locals = d._asdict()
-
-            # Some special processing for sell or cover trades. 
-            # Drawdown and stop loss need to be calculcated only once we are in a trade.
-            if type == TradeType.SELL or type == TradeType.COVER:                
-                drawdown = self.executeCondition( "( Price - Low ) / Price", globals, locals )
-                locals.update ( { 'Drawdown' : drawdown } )                
-
-                # Test the stoploss if one exists
-                if globals[ 'StopLoss' ] > 0:
-                    ret = self.executeCondition( "Low < StopLoss", globals, locals )
-                    if ret:
-                        price = self.executeCondition( "StopLoss * ( 1 - DISPERSION )", globals, locals )
-                        qty = 1             # better Qty is to use the remaining buy qty
-                        break
-
-            ret = self.executeCondition( condition, globals, locals )
-            if ret:
-                price = self.executeCondition( priceCondition, globals, locals )
-                if newStopLoss:
-                    stoploss = self.executeCondition( f"{newStopLoss}", globals, locals )
-                    env[ 'StopLoss' ] = stoploss
-                qty = qty
-                break
-        return ( price, qty, date )
-
-    @timer
-    def getBuys( self, strategy ):
-        if self.data.empty:
-            return
-        
-        print( "{}: calculating buy trades.".format( self.ticker() ) )
-
-        type = TradeType.BUY
-        tradeId = 1
-        env = self.params
-        for p in self.data.itertuples( index=True ):
-            date = p.Index
-            
-            for name in strategy:
-                ( timeframe, qty, condition, priceCondition, stopLoss ) = strategy[ name ]
-
-                data = self.processTimeframe( timeframe, date )
-
-                # Now we walk through data from startTime till endTime and find out if we meet the trade condition
-                ( price, qty, _ ) = self.findTrade( TradeType.BUY, data, condition, qty, priceCondition, stopLoss, env )
-
-                if price > 0:
-                    self.positions.loc[ tradeId ] = { 'Date': date, 'Type': type, 'Strategy' : name, 'Price': price, 'Quantity': qty, 'Ticker': self.ticker() }
-                    tradeId += 1
-
-        self.positions[ 'Date' ] = pd.to_datetime( self.positions[ 'Date' ] )
-
-    @timer
-    def getSales( self, strategy ):
-        if self.positions.empty:
-            return
-
-        print( "{}: calculating sell trades.".format( self.ticker() ) )
-
-        type = TradeType.SELL
-        tradeId = 1
-        env = self.params
-        for p in self.positions.itertuples( index=False ):
-            date = p.Date
-            totalQty = p.Quantity
-            env.update( { 'Price' : p.Price, 'StopLoss' : 0 } )
-            
-            self.trades.loc[ tradeId ] = p
-            tradeId += 1
-            
-            # Now we apply the sell conditions one by one until the entire position has been sold
-            # For each confition, we first fetch the date range that this condition needs to be applied to
-            for name in strategy:
-                ( timeframe, qty, condition, priceCondition, stopLoss ) = strategy[ name ]
-
-                if totalQty == 0:
-                    continue
-
-                data = self.processTimeframe( timeframe, date )
-                
-                # If the last trade was a partial sell, we need the next day to start executing 
-                # a sell strategy on the remaining quantity.
-                if totalQty < 1:
-                    data = data[ 1 : ]
-                
-                # Now we walk through data from startTime till endTime 
-                # and find out if we meet the sell condition
-                ( price, qty, date ) = self.findTrade( TradeType.SELL, data, condition, qty, priceCondition, stopLoss, env )
-
-                if price > 0 and qty > 0:
-                    qty = totalQty if totalQty < qty else qty
-                    self.trades.loc[ tradeId ] = { 'Date': date, 'Type': type, 'Strategy' : name, 'Price': price, 'Quantity': qty, 'Ticker': self.ticker() }
-                    totalQty -= qty
-                    tradeId += 1
-
-        self.trades[ 'Date' ] = pd.to_datetime( self.trades[ 'Date' ] )
-
-
-    def consolidateTrades( self, trades ):
-        consolidatedTrades = pd.DataFrame( columns=[ 'Date', 'Ticker', 'Type', 'BuyPrice', 'SellPrice', 'Profit' ] )
-
-        curTradeId = 0
-        avgSellPrice = 0
-        curQty = 0
-
-        for t in trades.itertuples( index=True ):
-            if t.Type == TradeType.BUY:
-                consolidatedTrades.loc[ t.Index ] = { 'Date': t.Date, 'BuyPrice': t.Price, 'Type' : 'LONG' }
-                if curTradeId == 0:
-                    # Initial condition when this BUY trade is the very first trade
-                    curTradeId = t.Index
-                else:
-                    # Every time we hit a BUY, we need to restart
-                    avgSellPrice = 0
-                    curQty = 0
-                    curTradeId = t.Index
-            elif t.Type == TradeType.SELL:
-                avgSellPrice = ( avgSellPrice * curQty + t.Price * t.Quantity ) / ( curQty + t.Quantity )
-                curQty += t.Quantity
-                consolidatedTrades.at[ curTradeId, 'SellPrice' ] = avgSellPrice
-
-        consolidatedTrades[ 'Ticker' ] = self.ticker()        
-        consolidatedTrades[ 'Profit'] = ( consolidatedTrades[ 'SellPrice' ] - consolidatedTrades[ 'BuyPrice' ] ) / consolidatedTrades[ 'BuyPrice' ]
-        return consolidatedTrades
-
-
-    def tradeRange( self, startDate=None, endDate=None, consolidate=True ):
-        if not startDate:
-            startDate = self.trades.index[ 0 ]
-        if not endDate:
-            endDate = self.trades.index[ -1 ]
-        trades = self.trades.query( 'Date > @startDate and Date < @endDate', inplace=False )
-
-        #print( trades )
-        if consolidate:
-            return self.consolidateTrades( trades )
-        else:
-            return trades
-
-    def trade( self, date, consolidate=True ):
-        return self.tradeRange( date, date )
-
-
-    def run( self, buy=True, sell=True ):
-        if buy:
-            self.getBuys( self.buyStrategy )
-        if sell:
-            self.getSales( self.sellStrategy )
-        self.cleanup()
-
-    def cleanup( self ):
-        pass
-
 class Stats( object ):
     numWin = 0
     numLoss = 0
@@ -315,13 +48,13 @@ class Simulator( object ):
     def __init__( self, config, env={} ) -> None:
         self.env = env
         self.trades_master = pd.DataFrame()
-        self.buyStrategy = OrderedDict()
-        self.sellStrategy = OrderedDict()
         self.tickers = []
         self.stats = Stats()
         self.params = {}
         self.config = config
         self.cache = {}
+        self.strategyInfo = {}
+        self._curStrategy = None
 
     def setTickers( self, args ):
         def processArgs( args ):
@@ -349,9 +82,51 @@ class Simulator( object ):
 
     def clearTrades( self, args ):
         self.trades_master = pd.DataFrame()
+
+    def simulate( self, args ):
+        start_date = pd.to_datetime( self.params[ "START_DATE" ] )
+        end_date = pd.to_datetime( self.params[ "END_DATE" ] )
+
+        threads = []
+        for t in self.tickers:
+            trader = TradeEngine( t, self.strategyInfo[ self._curStrategy ], self.params )
+            self.cache[ t ] = trader
+            buy, sell = ( True, True )
+            trader.run( buy, sell )
         
-    def print_summary( self, trades ):
+        for t in self.tickers:
+            trader = self.cache[ t ] 
+            trades = trader.tradeRange( start_date, end_date )
+
+            if trades is not None and not trades.empty:
+                self.trades_master = pd.concat( [ self.trades_master, trades ] )
+
+        if self.trades_master.empty:
+            print( "No Trades during this period." )
+            return
+
+        self.trades_master.sort_values( by=[ "Date" ], inplace=True )
+
+        self.calcPnl()
+        self.showSummary( self.trades_master )
+
+    def calcPnl( self, args=None ):
+        self.trades_master[ 'Invested' ] = self.params[ "INIT_CAP" ]
+
+        if self.params[ "COMPOUND" ]:
+            amount = self.params[ "INIT_CAP" ]
+            for row in self.trades_master.itertuples():
+                self.trades_master.loc[ row.Index, "Invested" ] = amount
+                amount = amount * ( 1 + row.Profit )
+
+        self.trades_master[ "Profits" ] =  self.trades_master[ "Invested" ] * self.trades_master[ "Profit" ] * self.trades_master[ 'Quantity' ]
+        self.trades_master[ "AggregateProfits" ] = self.trades_master[ "Profits" ].cumsum()
+
+    def showSummary( self, trades ):
         print( trades )
+
+        self.stats.numWin = self.trades_master[ self.trades_master[ "Profits" ] > 0 ][ "Profits" ].count()
+        self.stats.numLoss = self.trades_master[ self.trades_master[ "Profits" ] < 0 ][ "Profits" ].count()
         print( "winning trades: %s" % self.stats.numWin )
         print( "losing trades: %s" % self.stats.numLoss )
         print( "winning %: {}".format( round( self.stats.numWin / ( self.stats.numWin + self.stats.numLoss ) * 100 ) ) )
@@ -375,47 +150,6 @@ class Simulator( object ):
 
         print( trades[ "Profits" ].describe() )
         print( "Total profit: %d" % trades[ "Profits" ].sum() )
-
-    def simulate( self, args ):
-        start_date = pd.to_datetime( self.params[ "START_DATE" ] )
-        end_date = pd.to_datetime( self.params[ "END_DATE" ] )
-
-        threads = []
-        for t in self.tickers:
-            trader = TradeEngine( t, self.buyStrategy, self.sellStrategy, self.params )
-            self.cache[ t ] = trader
-            buy, sell = ( True, True )
-            trader.run( buy, sell )
-        
-        for t in self.tickers:
-            trader = self.cache[ t ] 
-            trades = trader.tradeRange( start_date, end_date )
-
-            if trades is not None and not trades.empty:
-                self.trades_master = pd.concat( [ self.trades_master, trades ] )
-
-        if self.trades_master.empty:
-            print( "No Trades during this period." )
-            return
-
-        self.trades_master.sort_values( by=[ "Date" ], inplace=True )
-
-        self.calcPnl()
-        self.stats.numWin = self.trades_master[ self.trades_master[ "Profits" ] > 0 ][ "Profits" ].count()
-        self.stats.numLoss = self.trades_master[ self.trades_master[ "Profits" ] < 0 ][ "Profits" ].count()
-        self.print_summary( simulator.trades_master )
-
-    def calcPnl( self, args=None ):
-        self.trades_master[ 'Invested' ] = self.params[ "INIT_CAP" ]
-
-        if self.params[ "COMPOUND" ]:
-            amount = self.params[ "INIT_CAP" ]
-            for row in self.trades_master.itertuples():
-                self.trades_master.loc[ row.Index, "Invested" ] = amount
-                amount = amount * ( 1 + row.Profit )
-
-        self.trades_master[ "Profits" ] =  self.trades_master[ "Invested" ] * self.trades_master[ "Profit" ]
-        self.trades_master[ "AggregateProfits" ] = self.trades_master[ "Profits" ].cumsum()
 
     def showTrades( self, args ):
         start_date = pd.to_datetime( self.params[ "START_DATE" ] )
@@ -445,7 +179,7 @@ class Simulator( object ):
             print( f"{k} : {v}" )
 
     def initParams( self ):
-        self.params = { 'Amount' : 0 }
+        self.params = { "Amount" : 0, "MAX_POSITION_SIZE" : 1.0 }
 
     def loadStrategy( self, args ):
         timeframe = "Day-All"
@@ -491,7 +225,7 @@ class Simulator( object ):
             elif "Timeframe" in key:
                 timeframe = value
                 return "()"
-            elif "StopLoss" in key:
+            elif "SetStopLoss" in key:
                 stoploss = value
                 return "()"
                 
@@ -518,23 +252,28 @@ class Simulator( object ):
         name = args.strip()
 
         with open( STRATEGY_FILE, 'r') as f:
-            strategyDict = yaml.load( f, Loader=yaml.FullLoader )
+            yamlDict = yaml.load( f, Loader=yaml.FullLoader )
 
-        if name in strategyDict:
-            strategy = strategyDict[ name ]
+        if name in yamlDict:
+            strategy = yamlDict[ name ]
+            self._curStrategy = name
+            print( "strategy : {}".format( name ) )
+            print( "=====================================" )
         else:
             print( "Strategy not found." )
             return
 
-        print( "strategy : {}".format( name ) )
-        print( "=====================================" )
+        self.strategyInfo[ name ] = {}
+        self.strategyInfo[ name ][ "code" ] = str( strategy )
+
         cacheKey = f"_{name}"
         if cacheKey in self.cache:
             oldStrategy = self.cache[ cacheKey ]
-
         self.cache[ cacheKey ] = strategy
         
         self.initParams()
+        buyStrategy = OrderedDict()
+        sellStrategy = OrderedDict()
         for key, value in strategy.items():
             if key.upper() == "PARAMS":
                 for k, v in value.items():
@@ -548,18 +287,22 @@ class Simulator( object ):
             if "BUY" in key.upper():
                 timeframe = "Day-All"
                 output = None
+                stoploss = None
                 condition = _parseCondition( key, value )
                 timeframe = _parseTimeframe( timeframe )
-                self.buyStrategy[ action ] = ( timeframe, qty, condition, output, stoploss )
-                print( "{} : {}".format( key, self.buyStrategy[ action ] ) )
+                buyStrategy[ action ] = ( timeframe, qty, condition, output, stoploss )
+                self.strategyInfo[ name ][ "buy" ] = buyStrategy
+                print( "{} : {}".format( key, buyStrategy[ action ] ) )
 
             if "SELL" in key.upper():
                 timeframe = "Day-All"
                 output = None
+                stoploss = None
                 condition = _parseCondition( key, value )
                 timeframe = _parseTimeframe( timeframe )
-                self.sellStrategy[ action ] = ( timeframe, qty, condition, output, stoploss )           
-                print( "{} : {}".format( key, self.sellStrategy[ action ] ) )
+                sellStrategy[ action ] = ( timeframe, qty, condition, output, stoploss )           
+                self.strategyInfo[ name ][ "sell" ] = sellStrategy
+                print( "{} : {}".format( key, sellStrategy[ action ] ) )
             print( "---" )
 
     def printStrategy( self, args ):
@@ -569,7 +312,10 @@ class Simulator( object ):
                 print ( "{} : {}\n".format( key, str( value ) ) )
 
     def printTimerInfo( self ):
-        print( timerData )
+        temp = {}
+        for k, v in timerData.items():
+            temp[ k ] = round( v, 2 )
+        print( temp )
 
 if __name__ == "__main__":
     pd.set_option( "display.max_rows", None )
