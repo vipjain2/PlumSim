@@ -45,9 +45,15 @@ class Shell( ShellCommon ):
 
     def do_show_trades( self, args ):
         self.config.app.showTrades( args )
+    
+    def do_show_best( self, args ):
+        self.config.app.showOutliers( args )
+
+    def do_show_worst( self, args ):
+        self.config.app.showOutliers( args )
         
     def do_simulate( self, args ):
         self.config.app.simulate( args )
         
     def do_show_pnl( self, args ):
-        self.config.app.calc_pnl( args )
+        self.config.app.showPnl( args )

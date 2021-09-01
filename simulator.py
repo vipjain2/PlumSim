@@ -34,8 +34,8 @@ STRATEGY_FILE = "./Strategy1.simulate"
 class PlumsimConfig( object ):
     threads = []
     web_thread_active = True
-    intraday = True
     verbose = True
+    debuglevel = 0
 
 ########################################################################
 # Simulator code starts here
@@ -89,7 +89,7 @@ class Simulator( object ):
 
         threads = []
         for t in self.tickers:
-            trader = TradeEngine( t, self.strategyInfo[ self._curStrategy ], self.params )
+            trader = TradeEngine( t, self.strategyInfo[ self._curStrategy ], self.params, self.config )
             self.cache[ t ] = trader
             buy, sell = ( True, True )
             trader.run( buy, sell )
@@ -107,23 +107,29 @@ class Simulator( object ):
 
         self.trades_master.sort_values( by=[ "Date" ], inplace=True )
 
-        self.calcPnl()
+        self.calcPnl( self. trades_master )
         self.showSummary( self.trades_master )
 
-    def calcPnl( self, args=None ):
-        self.trades_master[ 'Invested' ] = self.params[ "INIT_CAP" ]
+    def calcPnl( self, trades ):
+        if trades.empty:
+            return
+
+        trades[ 'Invested' ] = self.params[ "INIT_CAP" ]
 
         if self.params[ "COMPOUND" ]:
             amount = self.params[ "INIT_CAP" ]
-            for row in self.trades_master.itertuples():
-                self.trades_master.loc[ row.Index, "Invested" ] = amount
+            for row in trades.itertuples():
+                trades.loc[ row.Index, "Invested" ] = amount
                 amount = amount * ( 1 + row.Profit )
 
-        self.trades_master[ "Profits" ] =  self.trades_master[ "Invested" ] * self.trades_master[ "Profit" ] * self.trades_master[ 'Quantity' ]
-        self.trades_master[ "AggregateProfits" ] = self.trades_master[ "Profits" ].cumsum()
+        trades[ "Profits" ] =  trades[ "Invested" ] * trades[ "Profit" ] * trades[ 'Quantity' ]
+        trades[ "AggregateProfits" ] = trades[ "Profits" ].cumsum()
 
     def showSummary( self, trades ):
-        print( trades )
+        if self.trades_master.empty:
+            return
+        print( "last 10 trades..." )
+        print( trades.tail( 10 ) )
 
         self.stats.numWin = self.trades_master[ self.trades_master[ "Profits" ] > 0 ][ "Profits" ].count()
         self.stats.numLoss = self.trades_master[ self.trades_master[ "Profits" ] < 0 ][ "Profits" ].count()
@@ -151,17 +157,64 @@ class Simulator( object ):
         print( trades[ "Profits" ].describe() )
         print( "Total profit: %d" % trades[ "Profits" ].sum() )
 
+    def showPnl( self, args ):
+        args = args.split()
+        args = [ arg.strip().upper() for arg in args ]
+
+        if not args:
+            self.showSummary( self.trades_master )
+            return
+
+        if args[ 0 : 2 ] == [ "BY", "TICKER" ]:
+            trades = self.trades_master.groupby( [ 'Ticker' ] ).sum()
+            print( "---------" )
+            print( trades.loc[ : , 'Profits' ].to_string() )
+
+        elif args[ 0 ] in self.cache:
+            start_date = pd.to_datetime( self.params[ "START_DATE" ] )
+            end_date = pd.to_datetime( self.params[ "END_DATE" ] )
+            trades = self.cache[ args[ 0 ] ].tradeRange( start_date, end_date, consolidate=True )
+            self.calcPnl( trades )
+            self.showSummary( trades )
+
     def showTrades( self, args ):
+        args = args.split()
+        args = [ arg.strip().upper() for arg in args ]
+
+        if not args:
+            return
+
+        if args[ 0 ] == "CONSOLIDATE":
+            ticker = args[ 1 ]
+            consolidate=True
+        else:
+            ticker = args[ 0 ]
+            consolidate=False
+
+        if not ticker or ticker not in self.cache:
+            print( f"No data available for {ticker}." )
+            return
+
         start_date = pd.to_datetime( self.params[ "START_DATE" ] )
         end_date = pd.to_datetime( self.params[ "END_DATE" ] )
 
-        ticker = args.strip().upper()
+        trades = self.cache[ ticker ].tradeRange( start_date, end_date, consolidate=consolidate )
+        print( trades )
 
-        if not ticker or ticker not in self.cache:
+    def showOutliers( self, args ):
+        args = args.split()
+        args = [ arg.strip().upper() for arg in args ]
+
+        if not args:
             return
 
-        trades = self.cache[ ticker ].tradeRange( start_date, end_date, consolidate=False )
-        print( trades )
+        try:
+            n = eval( args[ 0 ] )
+        except:
+            n = 10
+
+        print( self.trades_master.sort_values( by=["Profits"], ascending=False ).tail( n ) )
+
 
     def exit( self ):
         print( "Exiting simulator" )
@@ -226,7 +279,7 @@ class Simulator( object ):
                 timeframe = value
                 return "()"
             elif "SetStopLoss" in key:
-                stoploss = value
+                stoploss = f"min( Open, {value} )"
                 return "()"
                 
         def _parseAction( key ):
@@ -274,11 +327,17 @@ class Simulator( object ):
         self.initParams()
         buyStrategy = OrderedDict()
         sellStrategy = OrderedDict()
+
         for key, value in strategy.items():
             if key.upper() == "PARAMS":
                 for k, v in value.items():
                     if isinstance( v, str ) and v.strip().endswith( '%' ):
                         v = eval( v.strip( '%' ) ) / 100
+
+                    if k == "MAX_LAVERAGE":
+                        k = "MAX_POSITION_SIZE"
+                        v = self.params[ k ] * eval( v.strip() )
+
                     self.params[ k ] = v
                 self.printParams()
 

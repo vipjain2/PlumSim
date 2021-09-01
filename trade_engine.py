@@ -25,12 +25,14 @@ class TradeType( Enum ):
     COVER = 4
 
 class TradeEngine( object ):
-    def __init__( self, ticker, strategyInfo, params={} ):
+    def __init__( self, ticker, strategyInfo, params={}, config=None ):
         self._ticker = ticker
         self.strategyInfo = strategyInfo
+        self.params = params
+        self.config = config
+
         self.buyStrategy = strategyInfo[ "buy" ]
         self.sellStrategy = strategyInfo[ "sell" ]
-        self.params = params
         self.stdin = sys.stdin
         self.stdout = sys.stdout
         self.tradeInfo = {}
@@ -127,7 +129,9 @@ class TradeEngine( object ):
                 for ( price, qty, date ) in self.tradeInfo[ "liveStopLoss" ]:
                     # Do not process stop losses that were set today
                     if date == tradeDate:
+                        keep += [ ( price, qty, date ) ]
                         continue
+                    
                     isTrade = _executeAndLogTrade( f"Low < {price}", f"{price} * ( 1 - DISPERSION )", qty )
                     if not isTrade:
                         keep += [ ( price, qty, date ) ]
@@ -135,8 +139,9 @@ class TradeEngine( object ):
 
             isTrade = _executeAndLogTrade( condition, priceCondition, tradeQty )
             if isTrade and stopLossCondition:
-                stopLossPrice = self.executeCondition( f"{stopLossCondition}", globals, locals )
-                self.tradeInfo[ "liveStopLoss" ] += [ ( stopLossPrice, stopQty, tradeDate ) ]
+                price = self.executeCondition( f"{stopLossCondition}", globals, locals )
+                qty = stopQty
+                self.tradeInfo[ "liveStopLoss" ] += [ ( price, qty, tradeDate ) ]
 
             if found:
                 break
@@ -296,7 +301,7 @@ class TradeEngine( object ):
             if len( stack ):
                 buyOrder = stack.pop()
                 if buyOrder.OpenQty == qty:
-                    consolidatedTrades.loc[ tradeId ] = pd.Series( buyOrder._replace( SellPrice=t.Price, SellDate=t.Date ), index=consolidatedTrades.columns )
+                    consolidatedTrades.loc[ tradeId ] = pd.Series( buyOrder._replace( SellPrice=t.Price, Quantity=qty, SellDate=t.Date ), index=consolidatedTrades.columns )
                     tradeId += 1
 
                 elif buyOrder.OpenQty > qty:
