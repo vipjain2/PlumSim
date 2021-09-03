@@ -31,8 +31,8 @@ class TradeEngine( object ):
         self.params = params
         self.config = config
 
-        self.buyStrategy = strategyInfo[ "buy" ]
-        self.sellStrategy = strategyInfo[ "sell" ]
+        self.buyStrategy = strategyInfo[ "BUY" ]
+        self.sellStrategy = strategyInfo[ "SELL" ]
         self.stdin = sys.stdin
         self.stdout = sys.stdout
         self.tradeInfo = {}
@@ -121,9 +121,6 @@ class TradeEngine( object ):
             # Some special processing for sell or cover trades. 
             # Drawdown and stop loss need to be calculcated only once we are in a trade.
             if type == TradeType.SELL or type == TradeType.COVER:                
-                drawdown = self.executeCondition( "( Price - Low ) / Price", globals, locals )
-                locals.update( { 'Drawdown' : drawdown } )                
-
                 # Test the stoploss if one exists
                 keep = []
                 for ( price, qty, date ) in self.tradeInfo[ "liveStopLoss" ]:

@@ -47,11 +47,11 @@ class Shell( ShellCommon ):
         self.config.app.showTrades( args )
     
     def do_show_best( self, args ):
-        self.config.app.showOutliers( args )
+        self.config.app.showOutliers( True, args )
 
     def do_show_worst( self, args ):
-        self.config.app.showOutliers( args )
-        
+        self.config.app.showOutliers( False, args )
+
     def do_simulate( self, args ):
         self.config.app.simulate( args )
         

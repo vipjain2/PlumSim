@@ -14,9 +14,10 @@ class Commands( object ):
                         ( r"[^a-zA-Z](PrevClose)(\d\d?\d?)?", "prevClose" ),
                         ( r"[^a-zA-Z](PrevDayHigh|PrevHigh)(\d\d?\d?)?", "prevHigh" ),
                         ( r"[^a-zA-Z](PrevDayLow|PrevLow)(\d\d?\d?)?", "prevLow" ),
-                        ( r"[^a-zA-Z](GapOpen)()", "gapOpen" ),
+                        ( r"[^a-zA-Z](GapOpen)(\d\d?\d?)?", "gapOpen" ),
                         ( r"[^a-zA-Z](PrevOpenCloseRange)(\d\d?\d?)?", "prevOpenCloseRange" ),
-                        ( r"[^a-zA-Z](PrevRange)(\d\d?\d?)?", "prevRange" ) ] 
+                        ( r"[^a-zA-Z](PrevRange|PrevHighLowRange)(\d\d?\d?)?", "prevRange" ),
+                        ( r"[^a-zA-Z](Range|HighLowRange)(\d\d?\d?)?", "range" ) ] 
     
     def compile( self, code, data ):
         indicators = []
@@ -30,12 +31,16 @@ class Commands( object ):
         print( f"compiled {indicators}" )
 
     @staticmethod
-    def processLabel( label, n ):
+    def processLabel( label, n, default=1 ):
         if not n:
             name = label
-        else:
+            n = default
+        elif isinstance( n, str ):
             name = f"{label}{n}"
             n = eval( n )
+        else:
+            name = label
+            n = n
         return ( name, n )
 
     @staticmethod
@@ -58,10 +63,10 @@ class Commands( object ):
             period = eval( period )
         cleanup = []
         if 'Range' not in data:
-            data[ 'Range' ] = data[ 'High' ] / data[ 'Low' ]
+            Commands.range( data, "Range", "" )
             cleanup = [ 'Range' ]
         
-        data[ name ] = round( ( data[ 'Range' ].rolling( period ).mean() - 1 ), 2 )
+        data[ name ] = round( ( data[ 'Range' ].rolling( period ).mean() ), 4 )
         data.drop( cleanup, axis=1, inplace=True )
 
     @staticmethod
@@ -72,56 +77,64 @@ class Commands( object ):
 
     @staticmethod
     def prevClose( data, label, n ):
-        name, n = Commands.processLabel( label, n )
-        data[ name ] = data.shift( axis=0 )[ "Close" ]
+        name, n = Commands.processLabel( label, n, 1 )
+        data[ name ] = data.shift( periods=n, axis=0 )[ "Close" ]
     
     @staticmethod
     def prevOpen( data, label, n ):
-        name, n = Commands.processLabel( label, n )
-        data[ name ] = data.shift( axis=0 )[ "Open" ]
+        name, n = Commands.processLabel( label, n, 1 )
+        data[ name ] = data.shift( periods=n, axis=0 )[ "Open" ]
 
     @staticmethod    
     def prevHigh( data, label, n ):
-        name, n = Commands.processLabel( label, n )
-        data[ name ] = data.shift( axis=0 )[ "High" ]
+        name, n = Commands.processLabel( label, n, 1 )
+        data[ name ] = data.shift( periods=n, axis=0 )[ "High" ]
 
     @staticmethod    
     def prevLow( data, label, n ):
-        name, n = Commands.processLabel( label, n )
-        data[ name ] = data.shift( axis=0 )[ "Low" ]
+        name, n = Commands.processLabel( label, n, 1 )
+        data[ name ] = data.shift( periods=n, axis=0 )[ "Low" ]
 
     @staticmethod
-    def gapOpen( data, label, *kargs ):
+    def gapOpen( data, label, n, *kargs, **kwargs ):
+        name, n = Commands.processLabel( label, n, 1 )
         cleanup = []
         if 'PrevClose' not in data:
-            Commands.prevClose( data, "PrevClose", "" )
+            Commands.prevClose( data, "PrevClose", n )
             cleanup += [ 'PrevClose' ]
         
-        data[ 'GapOpen' ] = ( data[ 'Open' ] - data[ 'PrevClose' ] ) / data[ 'PrevClose' ]
+        data[ name ] = ( data[ 'Open' ] - data[ 'PrevClose' ] ) / data[ 'PrevClose' ]
         data.drop( cleanup, axis=1, inplace=True )
 
     @staticmethod
-    def prevOpenCloseRange( data, label, *kargs ):
+    def range( data, label, n, *kargs, **kwargs ):
+        name, _ = Commands.processLabel( label, n, 1 )
+        data[ name ] = ( data[ 'High' ] / data[ 'Low' ] ) - 1
+
+    @staticmethod
+    def prevOpenCloseRange( data, label, n, *kargs, **kwargs ):
+        name, n = Commands.processLabel( label, n, 1 )
         cleanup = []
         if 'PrevClose' not in data:
-            Commands.prevClose( data, "PrevClose", "" )
+            Commands.prevClose( data, "PrevClose", n )
             cleanup += [ 'PrevClose' ]
         if 'PrevOpen' not in data:
-            Commands.prevOpen( data, 'PrevOpen', "" )
+            Commands.prevOpen( data, 'PrevOpen', n )
             cleanup += [ 'PrevOpen' ]
 
-        data[ 'PrevOpenCloseRange' ] = ( data[ 'PrevClose' ] - data[ 'PrevOpen' ] ) / data[ 'PrevClose' ]
+        data[ name ] = ( data[ 'PrevClose' ] - data[ 'PrevOpen' ] ) / data[ 'PrevClose' ]
         data.drop( cleanup, axis=1, inplace=True )
 
     @staticmethod
-    def prevRange( data, label, *kargs ):
+    def prevRange( data, label, n, *kargs, **kwargs ):
+        name, n = Commands.processLabel( label, n, 1 )
         cleanup = []
         if 'PrevHigh' not in data:
-            Commands.prevHigh( data, "PrevHigh", "" )
+            Commands.prevHigh( data, "PrevHigh", n )
             cleanup += [ 'PrevHigh' ]
         if 'PrevLow' not in data:
-            Commands.prevLow( data, 'PrevLow', "" )
+            Commands.prevLow( data, 'PrevLow', n )
             cleanup += [ 'PrevLow' ]
 
-        data[ 'PrevRange' ] = ( data[ 'PrevHigh' ] - data[ 'PrevLow' ] ) / data[ 'PrevLow' ]
+        data[ name ] = ( data[ 'PrevHigh' ] - data[ 'PrevLow' ] ) / data[ 'PrevLow' ]
         data.drop( cleanup, axis=1, inplace=True )

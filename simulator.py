@@ -126,16 +126,17 @@ class Simulator( object ):
         trades[ "AggregateProfits" ] = trades[ "Profits" ].cumsum()
 
     def showSummary( self, trades ):
-        if self.trades_master.empty:
+        if trades.empty:
             return
         print( "last 10 trades..." )
         print( trades.tail( 10 ) )
+        print( "---------" )
 
-        self.stats.numWin = self.trades_master[ self.trades_master[ "Profits" ] > 0 ][ "Profits" ].count()
-        self.stats.numLoss = self.trades_master[ self.trades_master[ "Profits" ] < 0 ][ "Profits" ].count()
-        print( "winning trades: %s" % self.stats.numWin )
-        print( "losing trades: %s" % self.stats.numLoss )
-        print( "winning %: {}".format( round( self.stats.numWin / ( self.stats.numWin + self.stats.numLoss ) * 100 ) ) )
+        numWin = trades[ trades[ "Profits" ] > 0 ][ "Profits" ].count()
+        numLoss = trades[ trades[ "Profits" ] < 0 ][ "Profits" ].count()
+        print( "winning trades: %s" % numWin )
+        print( "losing trades: %s" % numLoss )
+        print( "winning %: {}".format( round( numWin / ( numWin + numLoss ) * 100 ) ) )
 
         # Aggregate the statistics for each date
         ntrades = {}
@@ -201,7 +202,7 @@ class Simulator( object ):
         trades = self.cache[ ticker ].tradeRange( start_date, end_date, consolidate=consolidate )
         print( trades )
 
-    def showOutliers( self, args ):
+    def showOutliers( self, showBest, args ):
         args = args.split()
         args = [ arg.strip().upper() for arg in args ]
 
@@ -213,7 +214,7 @@ class Simulator( object ):
         except:
             n = 10
 
-        print( self.trades_master.sort_values( by=["Profits"], ascending=False ).tail( n ) )
+        print( self.trades_master.sort_values( by=["Profits"], ascending=showBest ).tail( n ) )
 
 
     def exit( self ):
@@ -234,10 +235,15 @@ class Simulator( object ):
     def initParams( self ):
         self.params = { "Amount" : 0, "MAX_POSITION_SIZE" : 1.0 }
 
+    def initStrategyInfo( self, name ):
+        self.strategyInfo[ name ] = {}
+        self.strategyInfo[ name ][ "BUY" ] = {}
+        self.strategyInfo[ name ][ "SELL" ] = {}
+
     def loadStrategy( self, args ):
         timeframe = "Day-All"
         output = None
-        stoploss = None
+        stopLoss = None
 
         def _parseTimeframe( timeframe ):
             p = r"""
@@ -252,7 +258,7 @@ class Simulator( object ):
         def _parseCondition( key, value ):
             nonlocal timeframe
             nonlocal output
-            nonlocal stoploss
+            nonlocal stopLoss
             if isinstance( value, dict ):
                 input = []
 
@@ -270,6 +276,7 @@ class Simulator( object ):
                     linkword = ""
 
                 return "( {} )".format( linkword.join( input ) )
+
             elif "In" in key:
                 return "( {} )".format( value )
             elif "Out" in key:
@@ -279,9 +286,9 @@ class Simulator( object ):
                 timeframe = value
                 return "()"
             elif "SetStopLoss" in key:
-                stoploss = f"min( Open, {value} )"
+                stopLoss = f"min( Open, {value} )"
                 return "()"
-                
+
         def _parseAction( key ):
             try:
                 [ action, qty ] = key.split( ',' )
@@ -316,18 +323,15 @@ class Simulator( object ):
             print( "Strategy not found." )
             return
 
-        self.strategyInfo[ name ] = {}
-        self.strategyInfo[ name ][ "code" ] = str( strategy )
-
         cacheKey = f"_{name}"
         if cacheKey in self.cache:
             oldStrategy = self.cache[ cacheKey ]
         self.cache[ cacheKey ] = strategy
         
+        self.initStrategyInfo( name )
+        self.strategyInfo[ name ][ "code" ] = str( strategy )
         self.initParams()
-        buyStrategy = OrderedDict()
-        sellStrategy = OrderedDict()
-
+        
         for key, value in strategy.items():
             if key.upper() == "PARAMS":
                 for k, v in value.items():
@@ -340,28 +344,37 @@ class Simulator( object ):
 
                     self.params[ k ] = v
                 self.printParams()
+                continue
 
+            timeframe = "Day-All"
+            output = None
+            stopLoss = None
+
+            # Pre-processing of conditions goes here, before we start parsing
+            
+            # Parsing starts from here
             action, qty = _parseAction( key )
+            condition = _parseCondition( key, value )
+            timeframe = _parseTimeframe( timeframe )
 
-            if "BUY" in key.upper():
-                timeframe = "Day-All"
-                output = None
-                stoploss = None
-                condition = _parseCondition( key, value )
-                timeframe = _parseTimeframe( timeframe )
-                buyStrategy[ action ] = ( timeframe, qty, condition, output, stoploss )
-                self.strategyInfo[ name ][ "buy" ] = buyStrategy
-                print( "{} : {}".format( key, buyStrategy[ action ] ) )
+            # Post-processing and store the parsed conditions
+            if "STOP" in action:
+                condition = f"Low < ( {condition} )"
+                output = f"( {output} ) * ( 1 - DISPERSION )"
+            
+            # Store the parsed output
+            parsedStrategy = ( timeframe, qty, condition, output, stopLoss )
 
-            if "SELL" in key.upper():
-                timeframe = "Day-All"
-                output = None
-                stoploss = None
-                condition = _parseCondition( key, value )
-                timeframe = _parseTimeframe( timeframe )
-                sellStrategy[ action ] = ( timeframe, qty, condition, output, stoploss )           
-                self.strategyInfo[ name ][ "sell" ] = sellStrategy
-                print( "{} : {}".format( key, sellStrategy[ action ] ) )
+            if "BUY" in action:
+                self.strategyInfo[ name ][ "BUY" ][ action ] = parsedStrategy
+
+            if "STOP" in action:
+                self.strategyInfo[ name ][ "SELL" ][ action ] = parsedStrategy
+
+            if "SELL" in action:
+                self.strategyInfo[ name ][ "SELL" ][ action ] = parsedStrategy
+            
+            print( "{} : {}".format( key, parsedStrategy ) )
             print( "---" )
 
     def printStrategy( self, args ):
