@@ -1,25 +1,14 @@
 from pathlib import Path
-from collections import OrderedDict
 import pandas as pd
 import numpy as np
-import threading
 import time
 import json
 import yaml
 import re
 from enum import Enum
 
-from dash_html_components.Hr import Hr
-import plotly
-import plotly.express as px
-import plotly.graph_objs as go
-import dash
-import dash_bootstrap_components as dbc
-import dash_core_components as dcc
-import dash_html_components as html
-from dash.dependencies import Input, Output
+from simulator_webserver import WebServer
 from ticker_data import DataLoaderUtils
-
 from simulator_shell import Shell, ShellConfig
 from utils_common import timer, timerData
 from trade_engine import TradeEngine
@@ -33,7 +22,6 @@ STRATEGY_FILE = "./Strategy1.simulate"
 ########################################################################
 class PlumsimConfig( object ):
     threads = []
-    web_thread_active = True
     verbose = True
     debuglevel = 0
 
@@ -48,6 +36,7 @@ class Simulator( object ):
     def __init__( self, config, env={} ) -> None:
         self.env = env
         self.trades_master = pd.DataFrame()
+        self.positions_master = pd.DataFrame()
         self.tickers = []
         self.stats = Stats()
         self.params = {}
@@ -151,11 +140,7 @@ class Simulator( object ):
                 dailyprofit[ t.Date ] = 0
             dailyprofit[ t.Date ] += t.Profit
 
-        #freq, bins = np.histogram( ntrades.values(), range=[ 0, 15 ] )
-        #for b, f in zip( bins[ 1 : ], freq ):
-        #    print( round( b, 1 ), ' '.join( np.repeat( '*', f ) ) )
-
-        print( trades[ "Profits" ].describe() )
+        print( trades[ "Profits" ].describe().to_string() )
         print( "Total profit: %d" % trades[ "Profits" ].sum() )
 
     def showPnl( self, args ):
@@ -171,6 +156,18 @@ class Simulator( object ):
             print( "---------" )
             print( trades.loc[ : , 'Profits' ].to_string() )
 
+        if args[ 0 : 2 ] == [ "BY", "DAY" ]:
+            trades = self.trades_master.groupby( [ 'Date' ] ).sum()
+            print( "---------" )
+            print( trades.loc[ : , 'Profits' ].to_string() )
+            self.custom_fig = px.histogram( trades, x="Profits" )
+
+        if args[ 0 : 2 ] == [ "BY", "INVESTED" ]:
+            trades = self.trades_master.groupby( [ 'Date' ] ).sum()
+            print( "---------" )
+            print( trades.loc[ : , 'Invested' ].to_string() )
+            self.custom_fig = px.histogram( trades, x="Invested" )
+
         elif args[ 0 ] in self.cache:
             start_date = pd.to_datetime( self.params[ "START_DATE" ] )
             end_date = pd.to_datetime( self.params[ "END_DATE" ] )
@@ -183,6 +180,8 @@ class Simulator( object ):
         args = [ arg.strip().upper() for arg in args ]
 
         if not args:
+            trades = self.trades_master
+            print( trades )
             return
 
         if args[ 0 ] == "CONSOLIDATE":
@@ -214,11 +213,14 @@ class Simulator( object ):
         except:
             n = 10
 
-        print( self.trades_master.sort_values( by=["Profits"], ascending=showBest ).tail( n ) )
-
+        if showBest:
+            print( self.trades_master.nlargest( n, "Profits" ) )
+        else:
+            print( self.trades_master.nsmallest( n, "Profits" ) )
 
     def exit( self ):
-        print( "Exiting simulator" )
+        pass
+        #print( "Exiting simulator" )
 
     def saveConfig( self, args ):
         _config = {}
@@ -268,9 +270,9 @@ class Simulator( object ):
                 # Clean up the list. Remove any empty parameters '()'
                 input = [ x for x in input if x != '()' ]
 
-                if key == "AND":
+                if "AND" in key:
                     linkword = " and "
-                elif key == "OR":
+                elif "OR" in key:
                     linkword = " or "
                 else:
                     linkword = ""
@@ -351,7 +353,7 @@ class Simulator( object ):
             stopLoss = None
 
             # Pre-processing of conditions goes here, before we start parsing
-            
+
             # Parsing starts from here
             action, qty = _parseAction( key )
             condition = _parseCondition( key, value )
@@ -394,54 +396,12 @@ if __name__ == "__main__":
 
     plumsimConfig = PlumsimConfig()
     simulator = Simulator( config=plumsimConfig )
-
-    app = dash.Dash( external_stylesheets=[dbc.themes.BOOTSTRAP] )
-    app.layout = dbc.Container(
-        [
-            html.H1( "Strategy performance for %s" % simulator.tickers ),
-            dbc.Tabs( 
-                [
-                    dbc.Tab( label="performance", tab_id="perf_graph" ),
-                    dbc.Tab( label="chart", tab_id="data_chart" )
-                ],
-                id = "tabs",
-                active_tab = "perf_graph",
-            ),
-            html.Div( id="tab-content", className="p-4" )        
-        ]
-    )
-
-    @app.callback(
-        Output( "tab-content", "children" ),
-        Input( "tabs", "active_tab" ),
-    )
-    def render_tab_content( active_tab ):
-        if active_tab == "perf_graph":
-            fig = px.line( simulator.trades_master, x="Date", y="AggregateProfits" )
-            return dcc.Graph( style={ "width": "120vh", "height": "70vh" }, figure=fig )
-        elif active_tab == "data_chart":
-            fig = go.Figure( data=go.Ohlc( x=trader.df[ "Date" ],
-                                            open=trader.df[ "Open" ],
-                                            high=trader.df[ "High" ],
-                                            low=trader.df[ "Low" ],
-                                            close=trader.df[ "Close" ] ) 
-                            )
-            #fig.update( layout_xaxis_rangeslider_visible=False )
-            return dcc.Graph( style={ "width": "120vh", "height": "70vh" }, figure=fig )
-
-    plumsimConfig.web_thread_active = True
-    def start_web_server():
-        app.run_server( debug=True, use_reloader=False, dev_tools_hot_reload=False )
-        while plumsimConfig.web_thread_active:
-            time.sleep( 5 )
-
-    web_thread = threading.Thread( target=start_web_server )
-    web_thread.start()
+    webServer = WebServer( simulator )
+    webServer.startServer()
 
     config = ShellConfig()
     config.app = simulator
     config.config = plumsimConfig
-    config.config.threads = [ web_thread ]
     config.utils = DataLoaderUtils()
 
     shell = Shell( config )

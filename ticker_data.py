@@ -116,6 +116,8 @@ class DataLoader( object ):
                              'marketVolume': 'volume' }, inplace=True )
         
         df = df[ [ 'date', 'minute', 'high', 'low', 'open', 'close', 'volume' ] ].set_index( [ 'date', 'minute' ] )
+        df.replace( to_replace=0, value=pd.NA, inplace=True )
+        df.fillna( axis=0, method="ffill" )
         return df
 
     def daily( self, start_date=None ):

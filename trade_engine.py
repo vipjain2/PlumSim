@@ -1,14 +1,10 @@
-from typing import NamedTuple, Type
-from builtin_commands import Commands
 from pathlib import Path
 from collections import OrderedDict, namedtuple
 import pandas as pd
-import numpy as np
-import time
 import sys, code, traceback
 from enum import Enum
 
-from ticker_data import DataLoader, DataLoaderUtils
+from ticker_data import DataLoader
 
 from utils_common import timer, timerData
 from builtin_commands import Commands
@@ -38,6 +34,7 @@ class TradeEngine( object ):
         self.tradeInfo = {}
         self.trades = pd.DataFrame( columns=[ 'Date', 'Ticker', 'Type', 'Strategy', 'Price', 'Quantity' ] )
         self.positions = pd.DataFrame( columns=[ 'Date', 'Ticker', 'Type', 'Strategy', 'Price', 'Quantity' ] )
+        self.openTrades = pd.DataFrame( columns=[ 'BuyDate', 'Type', 'BuyPrice', 'StopPrice', 'Quantity' ] )
 
         self.loader = DataLoader( DATA_DIR )
         self.data = self.loader.data( ticker, period="daily" )
@@ -129,7 +126,7 @@ class TradeEngine( object ):
                         keep += [ ( price, qty, date ) ]
                         continue
                     
-                    isTrade = _executeAndLogTrade( f"Low < {price}", f"{price} * ( 1 - DISPERSION )", qty )
+                    isTrade = _executeAndLogTrade( f"Low < {price}", f"min( Open, {price} ) * ( 1 - DISPERSION )", qty )
                     if not isTrade:
                         keep += [ ( price, qty, date ) ]
                 self.tradeInfo[ "liveStopLoss" ] = keep
@@ -140,8 +137,6 @@ class TradeEngine( object ):
                 qty = stopQty
                 self.tradeInfo[ "liveStopLoss" ] += [ ( price, qty, tradeDate ) ]
 
-            if found:
-                break
         return found
 
     @timer
@@ -325,6 +320,14 @@ class TradeEngine( object ):
         consolidatedTrades.drop( columns=[ 'OpenQty' ], inplace=True )
         consolidatedTrades[ 'Ticker' ] = self.ticker()
         consolidatedTrades[ 'Profit' ] = ( consolidatedTrades[ 'SellPrice' ] - consolidatedTrades[ 'BuyPrice' ] ) / consolidatedTrades[ 'BuyPrice' ]
+
+        # Trades on the stack which had no matching closing orders are the positions still open
+        i = 0
+        while stack:
+            i += 1
+            open = stack.pop()
+            self.openTrades.loc[ i ] = { "BuyDate" : open.Date, "Type" : open.Type, "BuyPrice" : open.BuyPrice, "Quantity" : open.OpenQty }
+
         return consolidatedTrades
 
 

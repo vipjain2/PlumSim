@@ -1,5 +1,5 @@
 from shell_common import ShellCommon, ShellConfig
-
+import os, signal
 
 class Shell( ShellCommon ):
     def __init__(self, config ):
@@ -11,13 +11,9 @@ class Shell( ShellCommon ):
     def do_quit( self, args ):
         """Exits the shell
         """
-        #self.config.config.web_thread_active = False
-        #self.message( "Waiting for threads to finish...")
-        #for th in self.config.config.threads:
-        #    th.join()
-        #self.message( "Done.")
         self.config.app.exit()
         self.message( "Exiting shell" )
+        os.kill( os.getpid(), signal.SIGTERM )
         raise SystemExit
 
     def do_update_cache( self, args ):
