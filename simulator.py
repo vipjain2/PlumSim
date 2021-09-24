@@ -6,8 +6,9 @@ import json
 import yaml
 import re
 from enum import Enum
+import plotly.express as px
 
-from simulator_webserver import WebServer
+from simulator_webserver import WebApp
 from ticker_data import DataLoaderUtils
 from simulator_shell import Shell, ShellConfig
 from utils_common import timer, timerData
@@ -35,7 +36,7 @@ class Stats( object ):
 class Simulator( object ):
     def __init__( self, config, env={} ) -> None:
         self.env = env
-        self.trades_master = pd.DataFrame()
+        self.trades_master = pd.DataFrame( columns=[ "Date", "SellDate", "Type", "BuyPrice", "SellPrice", "Quantity", "Ticker", "Profit", "Invested", "Profits", "AggregateProfits" ] )
         self.positions_master = pd.DataFrame()
         self.tickers = []
         self.stats = Stats()
@@ -65,9 +66,10 @@ class Simulator( object ):
                     else:
                         ticker = [ arg.upper() ]
                         tickers += ticker
-            return tickers
+            return set( tickers )
 
         self.tickers = processArgs( args )
+        print( "Item count: {}".format( len( self.tickers ) ) )
 
     def clearTrades( self, args ):
         self.trades_master = pd.DataFrame()
@@ -255,7 +257,11 @@ class Simulator( object ):
             """
 
             m = re.match( p, timeframe, re.VERBOSE )
-            return m.groups()
+            d1, t1, d2, t2 = m.groups()
+            t1 = 0 if not t1 else int( t1 )
+            t2 = 0 if not t2 else int( t2 )
+
+            return ( d1, t1, d2, t2 )
 
         def _parseCondition( key, value ):
             nonlocal timeframe
@@ -396,7 +402,7 @@ if __name__ == "__main__":
 
     plumsimConfig = PlumsimConfig()
     simulator = Simulator( config=plumsimConfig )
-    webServer = WebServer( simulator )
+    webServer = WebApp( simulator )
     webServer.startServer()
 
     config = ShellConfig()

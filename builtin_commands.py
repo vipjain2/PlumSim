@@ -1,8 +1,4 @@
-from os import stat
 import numpy as np
-import time
-from enum import Enum
-import re
 from re import match, search, findall
 
 class Commands( object ):
@@ -17,7 +13,8 @@ class Commands( object ):
                         ( r"[^a-zA-Z](GapOpen)(\d\d?\d?)?", "gapOpen" ),
                         ( r"[^a-zA-Z](PrevOpenCloseRange)(\d\d?\d?)?", "prevOpenCloseRange" ),
                         ( r"[^a-zA-Z](PrevRange|PrevHighLowRange)(\d\d?\d?)?", "prevRange" ),
-                        ( r"[^a-zA-Z](Range|HighLowRange)(\d\d?\d?)?", "range" ) ] 
+                        ( r"[^a-zA-Z](Range|HighLowRange)(\d\d?\d?)?", "range" ),
+                        ( r"[^a-zA-Z](DayOfTheWeek|DayOfWeek)(\d\d?\d?)?", "dayOfWeek" ) ]
     
     def compile( self, code, data ):
         indicators = []
@@ -30,8 +27,7 @@ class Commands( object ):
                 func( data, *m )
         print( f"compiled {indicators}" )
 
-    @staticmethod
-    def processLabel( label, n, default=1 ):
+    def processLabel( self, label, n, default=1 ):
         if not n:
             name = label
             n = default
@@ -43,18 +39,71 @@ class Commands( object ):
             n = n
         return ( name, n )
 
-    @staticmethod
-    def movingAvg( data, label, n ):
-        name, n = Commands.processLabel( label, n )
+    def depends( *kargsDepends ):
+        def wrapper( self, data, *kargs, **kwargs ):
+            cleanup = []
+            for d in kargsDepends:
+                if d not in data:
+                    for token in self.tokens:
+                        regex, fname = token
+                        matches = findall( regex, d )
+                        for m in matches:
+                            f = getattr( self, fname )
+                            f( data, *m )
+                cleanup += [ d ]
+            func( self, data, *kargs, **kwargs )
+            data.drop( cleanup, axis=1, inplace=True )
+
+    ########################################################################
+    # Code for indicators starts from here
+    ########################################################################
+    def dayOfWeek( self, data, label, *kargs, **kwargs ):
+        data[ label ] = data.index.strftime( '%A' )
+
+    def movingAvg( self, data, label, n ):
+        name, n = self.processLabel( label, n )
         data[ name ] = data[ 'Close' ].rolling( n ).mean()
     
-    @staticmethod
-    def expMovingAvg( data, label, n ):
-        name, n = Commands.processLabel( label, n )
+    def expMovingAvg( self, data, label, n ):
+        name, n = self.processLabel( label, n )
         data[ name ] = data[ 'Close' ].ewm( span=n ).mean()
 
-    @staticmethod
-    def adr( data, label, period ):
+    def trend( self, data, label, n ):
+        name, n = self.processLabel( label, n )
+        ma = f"MA{n}"
+        data[ name ] = data[ ma ].ewm( span=5 ).mean()
+
+    def prevClose( self, data, label, n ):
+        name, n = self.processLabel( label, n, 1 )
+        data[ name ] = data.shift( periods=n, axis=0 )[ "Close" ]
+    
+    def prevOpen( self, data, label, n ):
+        name, n = self.processLabel( label, n, 1 )
+        data[ name ] = data.shift( periods=n, axis=0 )[ "Open" ]
+
+    def prevHigh( self, data, label, n ):
+        name, n = self.processLabel( label, n, 1 )
+        data[ name ] = data.shift( periods=n, axis=0 )[ "High" ]
+
+    def prevLow( self, data, label, n ):
+        name, n = self.processLabel( label, n, 1 )
+        data[ name ] = data.shift( periods=n, axis=0 )[ "Low" ]
+
+    def range( self, data, label, n, *kargs, **kwargs ):
+        name, _ = self.processLabel( label, n, 1 )
+        data[ name ] = ( data[ 'High' ] / data[ 'Low' ] ) - 1
+
+    def gapOpen( self, data, label, n, *kargs, **kwargs ):
+        name, n = self.processLabel( label, n, 1 )
+        cleanup = []
+        if 'PrevClose' not in data:
+            self.prevClose( data, "PrevClose", n )
+            cleanup += [ 'PrevClose' ]
+        
+        data[ name ] = ( data[ 'Open' ] - data[ 'PrevClose' ] ) / data[ 'PrevClose' ]
+        data.drop( cleanup, axis=1, inplace=True )
+
+    def adr( self, data, label, period ):
         if not period:
             period = 20
             name = f"{label}"
@@ -63,77 +112,33 @@ class Commands( object ):
             period = eval( period )
         cleanup = []
         if 'Range' not in data:
-            Commands.range( data, "Range", "" )
+            self.range( data, "Range", 0 )
             cleanup = [ 'Range' ]
         
         data[ name ] = round( ( data[ 'Range' ].rolling( period ).mean() ), 4 )
         data.drop( cleanup, axis=1, inplace=True )
 
-    @staticmethod
-    def trend( data, label, n ):
-        name, n = Commands.processLabel( label, n )
-        ma = f"MA{n}"
-        data[ name ] = data[ ma ].ewm( span=5 ).mean()
-
-    @staticmethod
-    def prevClose( data, label, n ):
-        name, n = Commands.processLabel( label, n, 1 )
-        data[ name ] = data.shift( periods=n, axis=0 )[ "Close" ]
-    
-    @staticmethod
-    def prevOpen( data, label, n ):
-        name, n = Commands.processLabel( label, n, 1 )
-        data[ name ] = data.shift( periods=n, axis=0 )[ "Open" ]
-
-    @staticmethod    
-    def prevHigh( data, label, n ):
-        name, n = Commands.processLabel( label, n, 1 )
-        data[ name ] = data.shift( periods=n, axis=0 )[ "High" ]
-
-    @staticmethod    
-    def prevLow( data, label, n ):
-        name, n = Commands.processLabel( label, n, 1 )
-        data[ name ] = data.shift( periods=n, axis=0 )[ "Low" ]
-
-    @staticmethod
-    def gapOpen( data, label, n, *kargs, **kwargs ):
-        name, n = Commands.processLabel( label, n, 1 )
+    def prevOpenCloseRange( self, data, label, n, *kargs, **kwargs ):
+        name, n = self.processLabel( label, n, 1 )
         cleanup = []
         if 'PrevClose' not in data:
-            Commands.prevClose( data, "PrevClose", n )
-            cleanup += [ 'PrevClose' ]
-        
-        data[ name ] = ( data[ 'Open' ] - data[ 'PrevClose' ] ) / data[ 'PrevClose' ]
-        data.drop( cleanup, axis=1, inplace=True )
-
-    @staticmethod
-    def range( data, label, n, *kargs, **kwargs ):
-        name, _ = Commands.processLabel( label, n, 1 )
-        data[ name ] = ( data[ 'High' ] / data[ 'Low' ] ) - 1
-
-    @staticmethod
-    def prevOpenCloseRange( data, label, n, *kargs, **kwargs ):
-        name, n = Commands.processLabel( label, n, 1 )
-        cleanup = []
-        if 'PrevClose' not in data:
-            Commands.prevClose( data, "PrevClose", n )
+            self.prevClose( data, "PrevClose", n )
             cleanup += [ 'PrevClose' ]
         if 'PrevOpen' not in data:
-            Commands.prevOpen( data, 'PrevOpen', n )
+            self.prevOpen( data, 'PrevOpen', n )
             cleanup += [ 'PrevOpen' ]
 
         data[ name ] = ( data[ 'PrevClose' ] - data[ 'PrevOpen' ] ) / data[ 'PrevClose' ]
         data.drop( cleanup, axis=1, inplace=True )
 
-    @staticmethod
-    def prevRange( data, label, n, *kargs, **kwargs ):
-        name, n = Commands.processLabel( label, n, 1 )
+    def prevRange( self, data, label, n, *kargs, **kwargs ):
+        name, n = self.processLabel( label, n, 1 )
         cleanup = []
         if 'PrevHigh' not in data:
-            Commands.prevHigh( data, "PrevHigh", n )
+            self.prevHigh( data, "PrevHigh", n )
             cleanup += [ 'PrevHigh' ]
         if 'PrevLow' not in data:
-            Commands.prevLow( data, 'PrevLow', n )
+            self.prevLow( data, 'PrevLow', n )
             cleanup += [ 'PrevLow' ]
 
         data[ name ] = ( data[ 'PrevHigh' ] - data[ 'PrevLow' ] ) / data[ 'PrevLow' ]

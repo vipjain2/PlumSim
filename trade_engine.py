@@ -169,26 +169,37 @@ class TradeEngine( object ):
         self.positions[ 'Date' ] = pd.to_datetime( self.positions[ 'Date' ] )
 
     def processTimeframe( self, timeframe, date, startDate=None, endDate=None ):
+        """
+        startDate : the starting date of a trade. The date the trade is taken is day 1
+        """
         ( d1, t1, d2, t2 ) = timeframe
 
-        # The following stetement block should be converted to structural pattern matching
-        # once we upgrade to Python 3.10
-        if ( d1, t1, d2 ) == ( "Day", "1", None ):
-            if startDate is not None and date == startDate:
-                data = self.data.loc[ date : date ]
+        # Should be converted to structural pattern matching once we upgrade to Python 3.10
+        if ( d1, d2 ) == ( "Day", None ):
+            if startDate and startDate >= date:
+                data = self.data.loc[ startDate : ]
+                data = data.iloc[ t1 - 1 : t1 ]
             else:
                 data = pd.DataFrame()
 
         elif ( d1, d2 ) == ( "Day", "Day" ):
-            pass
-        
-        elif ( d1, d2 ) == ( "Day", "All" ):
-            if endDate is None:
-                data = self.data.loc[ date : ]  
+            if startDate and startDate >= date:
+                data = self.data.loc[ startDate : ]
+                data = data.iloc[ t1 - 1 : t2 - 1 ]
             else:
-                data = self.data.loc[ date : endDate ]
+                data = pd.DataFrame()
+
+        elif ( d1, d2 ) == ( "Day", "All" ):
+            if startDate and startDate >= date:
+                data = self.data.loc[ startDate : ]
+                data = data.iloc[ t1 - 1 : ] if t1 else data
+            else:
+                data = self.data.loc[ date : ]
+            
+            if endDate:
+                data = data.loc[ : endDate ]
                 data = data.iloc[ : -1 ]
-        
+
         elif ( d1, d2 ) == ( "1Min", "1Min" ):
             data = self.intradayData.loc[ date ]
         
@@ -203,8 +214,6 @@ class TradeEngine( object ):
         def _runStrategies( newQty, prevQty ):
             nonlocal tradeId
             found = False
-            cursor = 0
-            totalQty = 0
             remaining = newQty + prevQty
 
             for name in strategy:
@@ -326,7 +335,7 @@ class TradeEngine( object ):
         while stack:
             i += 1
             open = stack.pop()
-            self.openTrades.loc[ i ] = { "BuyDate" : open.Date, "Type" : open.Type, "BuyPrice" : open.BuyPrice, "Quantity" : open.OpenQty }
+            self.openTrades.loc[ i ] = { "BuyDate": open.Date, "Type": open.Type, "BuyPrice": open.BuyPrice, "StopPrice": 0, "Quantity": open.OpenQty }
 
         return consolidatedTrades
 
